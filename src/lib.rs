@@ -116,7 +116,24 @@ where
         // take the low bits and index into the number of bins we have
         // hash & mask = 0b011 & 0b....010 -> 0b00000000000010
 
+        let mask = table.bins.len() as u64 - 1;
+        let bini = (h & mask) as usize;
+        let bin = table.at(bini, guard);
+        if bin.is_null() {
+            return None;
+        }
+        let node = bin.find(h, key);
+        if node.is_null() {
+            return None;
+        }
+
+        return Some(Shared::from(unsafe { &*node.value.get() }));
     }
+
+    // pub fn get_and<R, F: FnOnce(&V) -> R>(&self, key:&K, then: F) -> Option<R> {
+    //     let guard = &crossbeam::epoch::pin();
+    //     self.get(key, guard).map(|v| then(&*v))
+    // }
 }
 
 struct Table<K, V, S> {

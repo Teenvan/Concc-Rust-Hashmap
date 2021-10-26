@@ -15,7 +15,7 @@ impl <K, V> BinEntry<K, V>
 where K: Eq,
 {
     pub(crate) fn find<'g>(&'g self, hash: u64, key: &K, guard: &'g Guard) 
-                -> Option<Shared<'g, Node<K, V>>> {
+                -> Shared<'g, Node<K, V>> {
         match *self {
             BinEntry::Node(ref n) => {
                 if n.hash == hash && &n.key == key {

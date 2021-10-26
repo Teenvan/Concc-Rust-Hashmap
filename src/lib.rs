@@ -94,12 +94,17 @@ impl <K, V, S> ConccHashMap<K, V, S>
 where 
     K: Hash,
     S: BuildHasher {
-    pub fn get<'g>(&'g self, key: &K, guard: &'g Guard) -> Option<Shared<'g, V>>{
+
+    fn hash(&self, key: &K) -> u64 {
         let mut h = self.build_hasher.build_hasher();
         // Give a mutable reference to the hasher
         key.hash(&mut h);
         // h is now the final hash for that key
-        let h = h.finish();
+        h.finish()
+    }
+
+    pub fn get<'g>(&'g self, key: &K, guard: &'g Guard) -> Option<Shared<'g, V>>{
+        let h = self.hash(key);
         // Read the table
         let table = self.table.load(Ordering::SeqCst, guard);
         if table.is_null() {
@@ -116,8 +121,7 @@ where
         // take the low bits and index into the number of bins we have
         // hash & mask = 0b011 & 0b....010 -> 0b00000000000010
 
-        let mask = table.bins.len() as u64 - 1;
-        let bini = (h & mask) as usize;
+        let bini = table.bini(h);
         let bin = table.at(bini, guard);
         if bin.is_null() {
             return None;
@@ -136,6 +140,33 @@ where
     //     let guard = &crossbeam::epoch::pin();
     //     self.get(key, guard).map(|v| then(&*v))
     // }
+
+
+    // All these methods take an immutable reference to self.
+    // Since this is a concurrent map
+     pub fn insert(&self, key: K, value: V) -> Option<()> {
+     }
+
+     fn put(&self, key: K, value: V, if_absent: bool) -> Option<()> {
+        let h = self.hash(&key);
+        let mut binCount = 0;
+        let guard = &crossbeam::epoch::pin();
+        loop {
+            let table = self.table.load(Ordering::SeqCst, guard);
+            if table.is_null() || table.bins.len() == 0 {
+                self.init_table();
+                continue;
+            }
+            
+            let bini = table.bini(h);
+            let bin = table.at(bini, guard);
+            if bin.is_null() {
+                // fast path
+                // If bin is empty, we just need to create a new node and put
+                // it there.
+            }
+        }
+     }
 }
 
 struct Table<K, V, S> {
@@ -145,6 +176,13 @@ struct Table<K, V, S> {
 }
 
 impl Table<K, V> {
+    
+    #[inline(always)]
+    fn bini(&self, hash: u64) -> usize {
+        let mask = self.bins.len() as u64 - 1;
+        (hash & mask) as usize
+    }
+    
     // Returns a ref to the ith element
     fn at<'g>(&'g self, i: usize, guard: &'g Guard) 
                     -> Shared<'g, &node::BinEntry<K, V>> {

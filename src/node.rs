@@ -1,4 +1,3 @@
-use std::cell::UnsafeCell;
 use crossbeam::epoch::{Atomic, Guard, Shared};
 use std::sync::atomic::Ordering;
 
@@ -46,7 +45,7 @@ pub(crate) struct Node<K, V> {
     pub(crate) hash: u64,
     pub(crate) key: K,
     // Use unsafecell for interior mutability
-    pub(crate) value: UnsafeCell<V>,
+    pub(crate) value: Atomic<V>,
     // Next does not need to be option since Atomic can be null
     pub(crate) next: Atomic<Node<K, V>>,
 }

@@ -127,7 +127,9 @@ where
             return None;
         }
 
-        return Some(Shared::from(unsafe { &*node.value.get() }));
+        let v = node.value.load(Ordering::SeqCst, guard);
+        assert!(!v.is_null());
+        Some(v)
     }
 
     // pub fn get_and<R, F: FnOnce(&V) -> R>(&self, key:&K, then: F) -> Option<R> {

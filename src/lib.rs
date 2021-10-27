@@ -78,7 +78,7 @@ mod node;
 // We can then combine this with a memory reclamation scheme because anytime
 // the guard is dropped, all refs are also dropped and then therefore you may
 // be able to do reclamation.
-use crossbeam::epoch::{Atomic, Guard, Shared};
+use crossbeam::epoch::{Atomic, Guard, Shared, Owned, CompareExchangeError};
 use std::sync::atomic::Ordering;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
@@ -86,7 +86,7 @@ use std::hash::{BuildHasher, Hash};
 // Main type
 pub struct ConccHashMap<K, V, S=RandomState> {
     // When we resize, we will allocate a new table
-    table: Atomic<Table<K, V, S>>,
+    table: Atomic<Table<K, V>>,
     build_hasher: S,
 }
 
@@ -150,10 +150,14 @@ where
      fn put(&self, key: K, value: V, if_absent: bool) -> Option<()> {
         let h = self.hash(&key);
         let mut binCount = 0;
-        let guard = &crossbeam::epoch::pin();
         loop {
+            // As long as you are holding a guard, you are holding up the epochs
+            // You are holding up the memory reclamation that might happen
+            let guard = &crossbeam::epoch::pin();
             let table = self.table.load(Ordering::SeqCst, guard);
             if table.is_null() || table.bins.len() == 0 {
+                // Don't hold up memory reclamation while constructing
+                drop(guard);
                 self.init_table();
                 continue;
             }
@@ -165,17 +169,21 @@ where
                 // If bin is empty, we just need to create a new node and put
                 // it there.
             }
+
+            // Slow path
+            // Bin is non-empty, need to link into it.
+
         }
      }
 }
 
-struct Table<K, V, S> {
+struct Table<K, V> {
     // TODO: Inline this instead?
     // Atomic does an heap allocation
     bins: [Atomic<node::BinEntry<K, V>>]
 }
 
-impl Table<K, V> {
+impl<K, V> Table<K, V> {
     
     #[inline(always)]
     fn bini(&self, hash: u64) -> usize {
@@ -185,7 +193,23 @@ impl Table<K, V> {
     
     // Returns a ref to the ith element
     fn at<'g>(&'g self, i: usize, guard: &'g Guard) 
-                    -> Shared<'g, &node::BinEntry<K, V>> {
-        self.bins[i].load(Ordering::Acquire)
+                    -> Shared<'g, node::BinEntry<K, V>> {
+        self.bins[i].load(Ordering::Acquire, guard)
+    }
+
+    // If cas_bin succeeds, then we get back a shared to the node 
+    // that was removed. And if the node that was removed is not
+    // empty, then we have to free it at some point.
+
+    // Owned is a value that you know that no one else has access to
+    fn cas_bin<'g>(&'g self, i: usize, current: Shared<node::BinEntry<K, V>>,
+            new: Owned<node::BinEntry<K, V>>,  guard: &'g Guard) 
+                    -> Result<Shared<'g, node::BinEntry<K, V>>,
+                    CompareExchangeError<'g, node::BinEntry<K, V>, Owned<node::BinEntry<K, V>>>> {
+        // Something is currently the first bin and we know what 
+        // the pointer to that is. That is current.
+        // As long that has not been changed, we want to replace
+        // it with the `new` bin entry.
+        self.bins[i].compare_exchange(current, new, Ordering::Acquire, Ordering::Acquire, guard)
     }
 }

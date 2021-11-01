@@ -82,6 +82,7 @@ use crossbeam::epoch::{Atomic, Guard, Shared, Owned, CompareExchangeError};
 use std::sync::atomic::Ordering;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
+use node::*;
 
 // Main type
 pub struct ConccHashMap<K, V, S=RandomState> {
@@ -144,34 +145,72 @@ where
 
     // All these methods take an immutable reference to self.
     // Since this is a concurrent map
-     pub fn insert(&self, key: K, value: V) -> Option<()> {
-     }
+     pub fn insert(&self, key: K, value: V) -> Option<()> {}
 
      fn put(&self, key: K, value: V, if_absent: bool) -> Option<()> {
         let h = self.hash(&key);
         let mut binCount = 0;
+        // As long as you are holding a guard, you are holding up the epochs
+        // You are holding up the memory reclamation that might happen
+        let guard = crossbeam::epoch::pin();
+        let mut table = self.table.load(Ordering::SeqCst, &guard);
         loop {
-            // As long as you are holding a guard, you are holding up the epochs
-            // You are holding up the memory reclamation that might happen
-            let guard = &crossbeam::epoch::pin();
-            let table = self.table.load(Ordering::SeqCst, guard);
             if table.is_null() || table.bins.len() == 0 {
-                // Don't hold up memory reclamation while constructing
-                drop(guard);
-                self.init_table();
+                table = self.init_table(guard);
                 continue;
             }
             
+            // Allocate a new node
+            let mut node = Owned::new(BinEntry::Node {
+                key,
+                value,
+                hash: h,
+                next: Atomic::null(),
+            });
+
             let bini = table.bini(h);
-            let bin = table.at(bini, guard);
+            let bin = table.bin(bini, guard);
             if bin.is_null() {
                 // fast path
                 // If bin is empty, we just need to create a new node and put
-                // it there.
+                // it in the front.
+                match table.cas_bin(bini, bin, node, guard) {
+                    Ok(_old_null_ptr) =>  {
+                        // assert!(_old_null_ptr.is_null());
+                        return None;
+                    }
+                    Err(changed) => {
+                        // Restore node
+                        assert!(!changed.current.is_null());
+                        node = changed.new;
+                        bin = changed.current;
+                    }
+                }
             }
 
             // Slow path
             // Bin is non-empty, need to link into it.
+            
+
+            // We will match on the bin
+
+            match *bin {
+                BinEntry::Moved(next_table) => {
+                    table = table.help_transfer(next_table);
+                    unimplemented!();
+                }
+                BinEntry::Node(ref head) 
+                    if if_absent && head.hash == h && &head.key == &head.key => {
+                        // Fast path if replacement is disallowed and 
+                        // first bin  matches.
+                        return Some(());
+                }
+                BinEntry::Node(ref head) => {
+                    // Bin is non-empty, need to link into it, so we must
+                    // take the lock.
+
+                }
+            }
 
         }
      }
@@ -190,9 +229,10 @@ impl<K, V> Table<K, V> {
         let mask = self.bins.len() as u64 - 1;
         (hash & mask) as usize
     }
-    
+
+    #[inline]
     // Returns a ref to the ith element
-    fn at<'g>(&'g self, i: usize, guard: &'g Guard) 
+    fn bin<'g>(&'g self, i: usize, guard: &'g Guard) 
                     -> Shared<'g, node::BinEntry<K, V>> {
         self.bins[i].load(Ordering::Acquire, guard)
     }
@@ -201,6 +241,7 @@ impl<K, V> Table<K, V> {
     // that was removed. And if the node that was removed is not
     // empty, then we have to free it at some point.
 
+    #[inline]
     // Owned is a value that you know that no one else has access to
     fn cas_bin<'g>(&'g self, i: usize, current: Shared<node::BinEntry<K, V>>,
             new: Owned<node::BinEntry<K, V>>,  guard: &'g Guard) 
@@ -210,6 +251,6 @@ impl<K, V> Table<K, V> {
         // the pointer to that is. That is current.
         // As long that has not been changed, we want to replace
         // it with the `new` bin entry.
-        self.bins[i].compare_exchange(current, new, Ordering::Acquire, Ordering::Acquire, guard)
+        self.bins[i].compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire, guard)
     }
 }

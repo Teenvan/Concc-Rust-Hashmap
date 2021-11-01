@@ -5,7 +5,9 @@ use std::sync::atomic::Ordering;
 // Will generally be `Node`. Any entry that is not first in the bin
 // will be a node.
 pub(crate) enum BinEntry<K, V> {
-    Node(Node<K, V>)
+    Node(Node<K, V>),
+    // Moved contains a const reference to the next table
+    Moved(*const super::Table<K, V>),
 }
 
 // We don't require K to be hashable because the 
@@ -30,7 +32,7 @@ where K: Eq,
                 if next.is_null() {
                     return Shared::null();
                 }
-                return next;
+                return next.find(hash, key, guard);
             }
         }
     }
@@ -47,5 +49,7 @@ pub(crate) struct Node<K, V> {
     // Use unsafecell for interior mutability
     pub(crate) value: Atomic<V>,
     // Next does not need to be option since Atomic can be null
-    pub(crate) next: Atomic<Node<K, V>>,
+    pub(crate) next: Atomic<BinEntry<K, V>>,
+    // Lock
+    pub(crate) lock: 
 }

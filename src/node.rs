@@ -1,5 +1,6 @@
 use crossbeam::epoch::{Atomic, Guard, Shared};
 use std::sync::atomic::Ordering;
+use parking_lot::lock_api::Mutex;
 
 // Entry in a bin
 // Will generally be `Node`. Any entry that is not first in the bin
@@ -32,7 +33,7 @@ where K: Eq,
                 if next.is_null() {
                     return Shared::null();
                 }
-                return next.find(hash, key, guard);
+                return n.find(hash, key, guard);
             }
         }
     }
@@ -49,7 +50,7 @@ pub(crate) struct Node<K, V> {
     // Use unsafecell for interior mutability
     pub(crate) value: Atomic<V>,
     // Next does not need to be option since Atomic can be null
-    pub(crate) next: Atomic<BinEntry<K, V>>,
+    pub(crate) next: Atomic<Node<K, V>>,
     // Lock
-    pub(crate) lock: 
+    pub(crate) lock: Mutex<()>,
 }

@@ -83,6 +83,7 @@ use std::sync::atomic::Ordering;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 use node::*;
+use parking_lot::lock_api::Mutex;
 
 // Main type
 pub struct ConccHashMap<K, V, S=RandomState> {
@@ -154,19 +155,19 @@ where
         // You are holding up the memory reclamation that might happen
         let guard = crossbeam::epoch::pin();
         let mut table = self.table.load(Ordering::SeqCst, &guard);
+        // Allocate a new node
+        let mut node = Owned::new(BinEntry::Node {
+            key,
+            value,
+            hash: h,
+            next: Atomic::null(),
+        });
+
         loop {
             if table.is_null() || table.bins.len() == 0 {
                 table = self.init_table(guard);
                 continue;
             }
-            
-            // Allocate a new node
-            let mut node = Owned::new(BinEntry::Node {
-                key,
-                value,
-                hash: h,
-                next: Atomic::null(),
-            });
 
             let bini = table.bini(h);
             let bin = table.bin(bini, guard);
@@ -200,7 +201,7 @@ where
                     unimplemented!();
                 }
                 BinEntry::Node(ref head) 
-                    if if_absent && head.hash == h && &head.key == &head.key => {
+                    if if_absent && head.hash == h && &head.key == &node.key => {
                         // Fast path if replacement is disallowed and 
                         // first bin  matches.
                         return Some(());
@@ -208,7 +209,25 @@ where
                 BinEntry::Node(ref head) => {
                     // Bin is non-empty, need to link into it, so we must
                     // take the lock.
+                    let _guard = head.lock.lock();
+                    // need to check that this is still the head
+                    let current_head = table.bin(bini, guard);
+                    if current_head.as_raw() != bin.as_raw() 
+                    {
+                        continue;
+                    }
 
+                    // Yes it is still the head so we can now "own" the bin
+                    // Note that there can still be readers in the bin!
+                    // Own basically means there will no other writers in 
+                    // this bin now.
+
+                    // TODO: TreeBin and ReservationNode
+
+                    bin_count = 1;
+                    loop {
+                        
+                    }
                 }
             }
 

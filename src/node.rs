@@ -20,19 +20,6 @@ where K: Eq,
                 -> Shared<'g, Node<K, V>> {
         match *self {
             BinEntry::Node(ref n) => {
-                if n.hash == hash && &n.key == key {
-                    return  Shared::from(n as *const _);
-                }
-                // Memory order acquire - 
-                // If an atomic store in thread A is tagged 
-                // memory_order_release and an atomic load in thread B 
-                // from the same variable is tagged memory_order_acquire
-                // once the atomic load is completed, 
-                // thread B is guaranteed to see everything thread A wrote to memory.
-                let next =  n.next.load(Ordering::SeqCst, guard);
-                if next.is_null() {
-                    return Shared::null();
-                }
                 return n.find(hash, key, guard);
             }
         }

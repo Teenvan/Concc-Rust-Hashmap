@@ -54,3 +54,27 @@ pub(crate) struct Node<K, V> {
     // Lock
     pub(crate) lock: Mutex<()>,
 }
+
+
+impl <K, V> Node<K, V> 
+where K: Eq,
+{
+    pub(crate) fn find<'g>(&'g self, hash: u64, key: &K, guard: &'g Guard) 
+                -> Shared<'g, Node<K, V>> {
+        
+        if self.hash == hash && &self.key == key {
+            return  Shared::from(self as *const _);
+        }
+        // Memory order acquire - 
+        // If an atomic store in thread A is tagged 
+        // memory_order_release and an atomic load in thread B 
+        // from the same variable is tagged memory_order_acquire
+        // once the atomic load is completed, 
+        // thread B is guaranteed to see everything thread A wrote to memory.
+        let next =  self.next.load(Ordering::SeqCst, guard);
+        if next.is_null() {
+            return Shared::null();
+        }
+        return next.find(hash, key, guard);
+    }
+}

@@ -148,9 +148,9 @@ where
     // Since this is a concurrent map
      pub fn insert(&self, key: K, value: V) -> Option<()> {}
 
-     fn put(&self, key: K, value: V, if_absent: bool) -> Option<()> {
+     fn put(&self, key: K, value: V, no_replacement: bool) -> Option<()> {
         let h = self.hash(&key);
-        let mut binCount = 0;
+        // let mut bin_count = 0;
         // As long as you are holding a guard, you are holding up the epochs
         // You are holding up the memory reclamation that might happen
         let guard = crossbeam::epoch::pin();
@@ -201,7 +201,7 @@ where
                     unimplemented!();
                 }
                 BinEntry::Node(ref head) 
-                    if if_absent && head.hash == h && &head.key == &node.key => {
+                    if no_replacement && head.hash == h && &head.key == &node.key => {
                         // Fast path if replacement is disallowed and 
                         // first bin  matches.
                         return Some(());
@@ -224,10 +224,48 @@ where
 
                     // TODO: TreeBin and ReservationNode
 
-                    bin_count = 1;
-                    loop {
+                    let mut bin_count = 1;
+                    let mut n = head;
+                    let old_val = loop {
+                        if n.hash == node.hash && &n.key == node.key {
+                            // the key already exists in the map
+                            if no_replacement {
+                                // The key is not absent, so dont update
+                            } else {
+                                // Value here is an atomic
+                                let now_garbage = n.value.swap(node.value,
+                                                       Ordering::SeqCst, 
+                                                       guard);
+                                unimplemented!("need to dispose of garbage");
+                            }
+                            break Some(());
+                        }
                         
+                        let next =  n.next.load(Ordering::SeqCst, guard);
+                        if next.is_null() 
+                        {
+                         // We have reached the end of the bin 
+                         // and now we can just put in our value
+                         // Stick the node here.
+                         // We have the lock so we know that nobody would 
+                         // be modifying under us.
+                         n.next.store(node, Ordering::SeqCst);
+                         break None;
+                        }
+
+                        n = next;
+                    };
+
+                    // TODO: Treeify threshold
+                    
+                    // If the old_val is some, we have not added a new
+                    // element so we don't need to increment the count.
+                    
+                    if old_val.is_none() {
+                        // increment count
                     }
+                    
+                    return old_val;
                 }
             }
 

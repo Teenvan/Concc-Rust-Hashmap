@@ -7,8 +7,7 @@ use parking_lot::lock_api::Mutex;
 // will be a node.
 pub(crate) enum BinEntry<K, V> {
     Node(Node<K, V>),
-    // Moved contains a const reference to the next table
-    Moved(*const super::Table<K, V>),
+    Moved,
 }
 
 // We don't require K to be hashable because the 
@@ -16,10 +15,38 @@ pub(crate) enum BinEntry<K, V> {
 impl <K, V> BinEntry<K, V> 
 where K: Eq,
 {
+    // We want find to be implemented on binentry not on node
+    // because if you hit something that is not a node, 
+    // you want find to chain to somewhere else.
     pub(crate) fn find<'g>(&'g self, hash: u64, key: &K, guard: &'g Guard) 
                 -> Shared<'g, Node<K, V>> {
+
+        // Rust does not guarantee tail recursion
+        // What is tail recursion ?
+        /*
+        In traditional recursion, the typical model is that you perform 
+        your recursive calls first, and then you take the return value 
+        of the recursive call and calculate the result. In this manner, you 
+        don't get the result of your calculation until you have returned from 
+        every recursive call.
+
+        In tail recursion, you perform your calculations first, and then 
+        you execute the recursive call, passing the results of your 
+        current step to the next recursive step. This results in the 
+        last statement being in the form of 
+        (return (recursive-function params)). Basically, the return 
+        value of any given recursive step is the same as the return 
+        value of the next recursive call.
+
+        The consequence of this is that once you are ready to perform 
+        your next recursive step, you don't need the current stack frame 
+        any more. This allows for some optimization. In fact, with an 
+        appropriately written compiler, you should never have a 
+        stack overflow snicker with a tail recursive call. Simply reuse 
+        the current stack frame for the next recursive step. 
+        */
         match *self {
-            BinEntry::Node(ref n) => {
+            BinEntry::Node(ref n) => { 
                 return n.find(hash, key, guard);
             }
         }
@@ -34,11 +61,15 @@ where K: Eq,
 pub(crate) struct Node<K, V> {
     pub(crate) hash: u64,
     pub(crate) key: K,
-    // Use unsafecell for interior mutability
+    // Use unsafecell for interior mutability (to give the ability to mutate
+    // the node)
+    // Cells are generally types that give you interior mutability ->
+    // so the ability to have a immutable reference or pointer to something 
+    // and a mutable pointer to the underlying data.
     pub(crate) value: Atomic<V>,
     // Next does not need to be option since Atomic can be null
     pub(crate) next: Atomic<Node<K, V>>,
-    // Lock
+    // Lock (parkinglog mutex is a lot smaller than the std lib)
     pub(crate) lock: Mutex<()>,
 }
 

@@ -84,16 +84,36 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 use node::*;
 use parking_lot::lock_api::Mutex;
+use std::sync::atomic::{AtomicUsize, AtomicIsize};
 
 // Main type
 pub struct ConccHashMap<K, V, S=RandomState> {
     // When we resize, we will allocate a new table
-    table: Atomic<Table<K, V>>,
+    // This is the base of the map
+    // We need a notion of a table that is separate from 
+    // the notion of a hashmap.
+    /// The array of bins. Lazily initialized upon first insertion.
+    /// Size is always a power of 2. Accessed directly by iterators. 
+    table: Atomic<Table<K, V, S>>,
+    /// The next table to use; non-null only while resizing. 
+    next_table: Atomic<Table<K, V, S>>,
+    /// The next table index (plus one) to split while resizing. 
+    transfer_index: AtomicIsize,
     build_hasher: S,
+    count: AtomicUsize,
+    /*
+     * Table initialization and resizing control. When negative, the
+     * table is being initialized or resized: -1 for initialization,
+     * else  -(1 + the number of active resizing threads). Otherwise,
+     * when table is null, holds the initial table size to use upon 
+     * creation, or 0 for default. After initialization, holds the 
+     * next element count value upon which to resize the table.
+     */ 
+    size_ctl: AtomicIsize
 }
 
 impl <K, V, S> ConccHashMap<K, V, S> 
-where 
+where  
     K: Hash,
     S: BuildHasher {
 
@@ -103,6 +123,85 @@ where
         key.hash(&mut h);
         // h is now the final hash for that key
         h.finish()
+    }
+
+    fn add_count(&self, n: isize, resize_hint: Option<usize>) {
+        
+        // TODO: Implement the java Countercell business here
+
+        let count = if n > 0 {
+            self.count.fetch_add(n as usize, Ordering::SeqCst)
+        } else if n < 0 {
+            let n = n.abs() as usize;
+            self.count.fetch_sub(n, Ordering::SeqCst) - n
+        } else {
+            self.count.load(Ordering::SeqCst)
+        };
+
+        // if resize_hint is None, it means the caller does not want us to
+        // consider a resize
+        // If it is Some(n), the caller saw n entries in a bin
+
+        if resize_hint.is_none() {
+            return;
+        }
+
+        let saw_bin_length = resize_hint.unwrap();
+
+        loop {
+            let sc = self.size_ctl.load(Ordering::SeqCst);
+
+            if count < sc {
+                // Do nothing since we are not at the next resize point yet 
+                break;
+            }
+
+            // Read the table
+            let guard = crossbeam::epoch::pin();
+            let mut table = self.table.load(Ordering::SeqCst, &guard);
+
+            if table.is_null() {
+                // table will be initialized by another thread anyway
+                break;
+            }
+            
+            let n = table.bins.len();
+            if n >= MAXIMUM_CAPACITY {
+                // cannot resize any more anyway
+                break;
+            }
+
+            let rs = Self::resize_stamp(n) << RESIZE_STAMP_SHIFT;
+            if sc < 0 {
+                // Ongoing resize
+                // There is already a resize happening
+                // Can we join the resize transfer ?
+                if sc == rs + MAX_RESIZERS || sc == rs + 1 {
+                    break;
+                }
+
+                let nt = self.next_table.load(Ordering::SeqCst, &guard);
+                if nt.is_null() {
+                    break;
+                }
+
+                if self.transfer_index.load(Ordering::SeqCst) <= 0 {
+                    break;
+                }
+
+                // Try to join the resize transfer
+                if self.size_ctl.compare_exchange(sc, sc+1, Ordering::SeqCst, Ordering::Acquire) == sc {
+                    self.transfer(table, nt);
+                }
+            } else if self.size_ctl.compare_exchange(sc, rs + 2, Ordering::SeqCst, Ordering::Acquire) == sc {
+                // a resize is needed, but has not yet started
+                // There is no new table yet
+                self.transfer(table, Atomic::null());
+            }
+
+            // another resize maybe needed
+            count = self.count.load(Ordering::SeqCst); 
+        }
     }
 
     pub fn get<'g>(&'g self, key: &K, guard: &'g Guard) -> Option<Shared<'g, V>>{
@@ -118,13 +217,15 @@ where
         }
 
         // hash = 0b10010010011101111010111010
-        // 4 bins == 0b100
+        // 4 bins == 0b100 (Binary representation of 4)
         // mask = (4-1) == 0b011
         // take the low bits and index into the number of bins we have
         // hash & mask = 0b011 & 0b....010 -> 0b00000000000010
 
         let bini = table.bini(h);
         let bin = table.at(bini, guard);
+
+        // If the map is being destroyed
         if bin.is_null() {
             return None;
         }
@@ -178,10 +279,13 @@ where
                 match table.cas_bin(bini, bin, node, guard) {
                     Ok(_old_null_ptr) =>  {
                         // assert!(_old_null_ptr.is_null());
+                        self.add_count(1, 0);
                         return None;
                     }
                     Err(changed) => {
                         // Restore node
+
+                        // Asserting is not really necessary
                         assert!(!changed.current.is_null());
                         node = changed.new;
                         bin = changed.current;
@@ -196,8 +300,8 @@ where
             // We will match on the bin
 
             match *bin {
-                BinEntry::Moved(next_table) => {
-                    table = table.help_transfer(next_table);
+                BinEntry::Moved => {
+                    table = table.help_transfer();
                     unimplemented!();
                 }
                 BinEntry::Node(ref head) 
@@ -205,17 +309,21 @@ where
                         // Fast path if replacement is disallowed and 
                         // first bin  matches.
                         return Some(());
-                }
+                } 
                 BinEntry::Node(ref head) => {
                     // Bin is non-empty, need to link into it, so we must
                     // take the lock.
                     let _guard = head.lock.lock();
                     // need to check that this is still the head
                     let current_head = table.bin(bini, guard);
+                    // We need to compare the pointers hence as_raw
                     if current_head.as_raw() != bin.as_raw() 
                     {
+                        // nope -- try again from the start
                         continue;
                     }
+
+
 
                     // Yes it is still the head so we can now "own" the bin
                     // Note that there can still be readers in the bin!
@@ -224,15 +332,17 @@ where
 
                     // TODO: TreeBin and ReservationNode
 
+                    // Bin count is the count of the bins you had a look at
                     let mut bin_count = 1;
                     let mut n = head;
-                    let old_val = loop {
+                    let old_val = loop { 
                         if n.hash == node.hash && &n.key == node.key {
                             // the key already exists in the map
                             if no_replacement {
                                 // The key is not absent, so dont update
                             } else {
-                                // Value here is an atomic
+                                // Value here is an atomic so we will swap 
+                                // in the new value 
                                 let now_garbage = n.value.swap(node.value,
                                                        Ordering::SeqCst, 
                                                        guard);
@@ -241,6 +351,8 @@ where
                             break Some(());
                         }
                         
+                        // TODO: This ordering can probably be relaxed due to
+                        // the mutex.
                         let next =  n.next.load(Ordering::SeqCst, guard);
                         if next.is_null() 
                         {
@@ -263,6 +375,7 @@ where
                     
                     if old_val.is_none() {
                         // increment count
+                        self.add_count(1, bin_count);
                     }
                     
                     return old_val;
@@ -270,6 +383,12 @@ where
             }
 
         }
+     }
+
+     /// Returns the stamp bits for resizing a table of size n.
+     /// Must be negative when shifted left by RESIZE_STAMP_SHIFT
+     fn resize_stamp(n: isize) -> isize {
+         n.leading_zeros() | (1 << (RESIZE_STAMP_BITS - 1))
      }
 }
 
@@ -308,6 +427,7 @@ impl<K, V> Table<K, V> {
         // the pointer to that is. That is current.
         // As long that has not been changed, we want to replace
         // it with the `new` bin entry.
+        // For instance, in case of insert, the current is null.
         self.bins[i].compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire, guard)
     }
 }
